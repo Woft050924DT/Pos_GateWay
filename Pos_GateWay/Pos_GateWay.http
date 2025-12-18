@@ -1,0 +1,6 @@
+@Pos_GateWay_HostAddress = http://localhost:5133
+
+GET {{Pos_GateWay_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###

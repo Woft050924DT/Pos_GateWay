@@ -1,12 +1,12 @@
 ﻿using Microsoft.Extensions.Options;
 using Microsoft.IdentityModel.Tokens;
-using Newtonsoft.Json;
 using Pos_GateWay.Helper;
 using Pos_GateWay.Models;
 using System.IdentityModel.Tokens.Jwt;
 using System.Net;
 using System.Security.Claims;
 using System.Text;
+using System.Text.Json;
 
 namespace Pos_GateWay
 {
@@ -14,57 +14,119 @@ namespace Pos_GateWay
     {
         private readonly RequestDelegate _next;
         private readonly AppSettings _appSettings;
-        private readonly HdvContext _db;
+        private static readonly JsonSerializerOptions JsonOptions = new()
+        {
+            PropertyNameCaseInsensitive = true,
+            WriteIndented = true
+        };
 
-        public JwtMiddleware(RequestDelegate next, IOptions<AppSettings> appSettings, IConfiguration configuration)
+        public JwtMiddleware(
+        RequestDelegate next,
+        IOptions<AppSettings> appSettings)
         {
             _next = next;
             _appSettings = appSettings.Value;
-            _db = new HdvContext(configuration);
         }
 
-        public Task Invoke(HttpContext context)
+        public Task Invoke(HttpContext context, HdvContext db)
         {
-            // Thêm CORS headers
-            context.Response.Headers.Add("Access-Control-Allow-Origin", "*");
-            context.Response.Headers.Add("Access-Control-Expose-Headers", "*");
+            context.Response.Headers.TryAdd("Access-Control-Allow-Origin", "*");
+            context.Response.Headers.TryAdd("Access-Control-Expose-Headers", "*");
 
-            // Kiểm tra nếu không phải endpoint login thì chuyển tiếp request
-            if (!context.Request.Path.Equals("/api/login", StringComparison.Ordinal))
+            if (!context.Request.Path.Equals("/api/login", StringComparison.OrdinalIgnoreCase))
             {
                 return _next(context);
             }
 
-            // Xử lý login
-            if (context.Request.Method.Equals("POST") && context.Request.HasFormContentType)
+            if (context.Request.Method.Equals("POST", StringComparison.OrdinalIgnoreCase)
+                && (context.Request.HasFormContentType
+                    || context.Request.ContentType?.Contains("application/json", StringComparison.OrdinalIgnoreCase) == true))
             {
-                return GenerateToken(context);
+                return GenerateToken(context, db);
             }
 
             context.Response.StatusCode = 400;
             return context.Response.WriteAsync("Bad request.");
         }
 
-        public async Task GenerateToken(HttpContext context)
+        private async Task<(string? Username, string? Password)> ReadCredentials(HttpContext context)
         {
-            var username = context.Request.Form["Username"].ToString();
-            var password = context.Request.Form["Password"].ToString();
-
-            // Validate input
-            if (string.IsNullOrEmpty(username) || string.IsNullOrEmpty(password))
+            if (context.Request.HasFormContentType)
             {
-                context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
-                var errorResult = JsonConvert.SerializeObject(new
+                var form = await context.Request.ReadFormAsync();
+                var username = form["username"].ToString();
+                var password = form["password"].ToString();
+
+                if (string.IsNullOrWhiteSpace(username))
+                {
+                    username = form["Username"].ToString();
+                }
+
+                if (string.IsNullOrWhiteSpace(password))
+                {
+                    password = form["Password"].ToString();
+                }
+
+                return (username, password);
+            }
+
+            if (context.Request.ContentType?.Contains("application/json", StringComparison.OrdinalIgnoreCase) == true)
+            {
+                try
+                {
+                    var login = await JsonSerializer.DeserializeAsync<LoginRequest>(context.Request.Body, JsonOptions);
+                    return (login?.Username, login?.Password);
+                }
+                catch
+                {
+                    return (null, null);
+                }
+            }
+
+            return (null, null);
+        }
+
+        private async Task WriteJson(HttpContext context, int statusCode, object payload)
+        {
+            context.Response.StatusCode = statusCode;
+            context.Response.ContentType = "application/json";
+            await context.Response.WriteAsync(JsonSerializer.Serialize(payload, JsonOptions));
+        }
+
+        public async Task GenerateToken(HttpContext context, HdvContext db)
+        {
+            var (username, password) = await ReadCredentials(context);
+            if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(password))
+            {
+                await WriteJson(context, (int)HttpStatusCode.BadRequest, new
                 {
                     code = (int)HttpStatusCode.BadRequest,
                     error = "Username và Password không được để trống"
                 });
-                await context.Response.WriteAsync(errorResult);
                 return;
             }
 
-            // Query user với thông tin Role - so sánh trực tiếp username, password và IsActive
-            var user = (from u in _db.Users
+            if (string.IsNullOrWhiteSpace(_appSettings.Secret))
+            {
+                await WriteJson(context, (int)HttpStatusCode.InternalServerError, new
+                {
+                    code = (int)HttpStatusCode.InternalServerError,
+                    error = "JWT Secret chưa được cấu hình"
+                });
+                return;
+            }
+
+            if (Encoding.UTF8.GetByteCount(_appSettings.Secret) < 32)
+            {
+                await WriteJson(context, (int)HttpStatusCode.InternalServerError, new
+                {
+                    code = (int)HttpStatusCode.InternalServerError,
+                    error = "JWT Secret phải có tối thiểu 32 ký tự"
+                });
+                return;
+            }
+
+            var user = (from u in db.Users
                         where u.Username == username
                            && u.PasswordHash == password
                            && u.IsActive == true
@@ -78,22 +140,18 @@ namespace Pos_GateWay
                             RoleName = u.Role != null ? u.Role.RoleName : "User"
                         }).SingleOrDefault();
 
-            // Kiểm tra user tồn tại và password đúng
             if (user == null)
             {
-                context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
-                var result = JsonConvert.SerializeObject(new
+                await WriteJson(context, (int)HttpStatusCode.BadRequest, new
                 {
                     code = (int)HttpStatusCode.BadRequest,
                     error = "Tài khoản hoặc mật khẩu không đúng"
                 });
-                await context.Response.WriteAsync(result);
                 return;
             }
 
-            // Tạo JWT token
             var tokenHandler = new JwtSecurityTokenHandler();
-            var key = Encoding.ASCII.GetBytes(_appSettings.Secret);
+            var key = Encoding.UTF8.GetBytes(_appSettings.Secret);
             var tokenDescriptor = new SecurityTokenDescriptor
             {
                 Subject = new ClaimsIdentity(new Claim[]
@@ -112,7 +170,6 @@ namespace Pos_GateWay
             var token = tokenHandler.CreateToken(tokenDescriptor);
             var tokenString = tokenHandler.WriteToken(token);
 
-            // Tạo response
             var response = new
             {
                 UserId = user.UserId,
@@ -124,13 +181,13 @@ namespace Pos_GateWay
                 ExpiresAt = tokenDescriptor.Expires
             };
 
-            var serializerSettings = new JsonSerializerSettings
-            {
-                Formatting = Formatting.Indented
-            };
+            await WriteJson(context, (int)HttpStatusCode.OK, response);
+        }
 
-            context.Response.ContentType = "application/json";
-            await context.Response.WriteAsync(JsonConvert.SerializeObject(response, serializerSettings));
+        private sealed class LoginRequest
+        {
+            public string? Username { get; set; }
+            public string? Password { get; set; }
         }
     }
 }
